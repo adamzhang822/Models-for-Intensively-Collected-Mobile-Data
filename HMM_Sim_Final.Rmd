@@ -1,0 +1,480 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# Prep
+```{r, warning=FALSE}
+# Prep
+## Load libraries and set working directory
+library(MASS)
+library(lme4)
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+set.seed(123456)
+```
+
+
+
+# Set Simulation Parameters 
+```{r}
+# Set Simulation Parameters
+niter_t <- 2000
+nwarmup_t <- 1000
+nchains_t <- 4
+
+## Set simulation parameter
+nsubj_t <- 100   # Num timeseries.
+nt_t <- 10       # Length of timeseries.
+p0_t <- 0.5      # Initial prob state=1
+tp_t <- matrix(c(0.9,0.1,
+               0.3,0.7),
+             nrow = 2,
+             byrow = TRUE)   # Transition probabilities
+
+mu.1 <- 1
+mu.2 <- 2
+mu_t <- c(mu.1, mu.2)  # Emission location parameter
+
+sd.1 <- 2
+sd.2 <- 1
+sig_e_t <- c(sd.1, sd.2)  # Emission scale parameter
+
+cor_ls <- -0.3
+var_ls <- c(1.0, 0.3)  # Random subject effect variance
+cov_ls_t <- matrix(c(var_ls[1], sqrt(var_ls[1]) * sqrt(var_ls[2]) * cor_ls,
+                   sqrt(var_ls[1]) * sqrt(var_ls[2]) * cor_ls, var_ls[2]),
+                 nrow = 2, byrow = TRUE)
+```
+
+
+
+# Data Generation Function
+```{r}
+## Data generation
+DataGen_HMM <- function(scenario,
+                     nsubj = nsubj_t,
+                     nt = nt_t,
+                     p0 = p0_t,
+                     tp = tp_t,
+                     mu = mu_t,
+                     sig_e = sig_e_t,
+                     cov_ls = cov_ls_t){
+  # Initialise state and data structures.
+  Z <- rep(NA, nsubj * nt)
+  dim(Z) <- c(nsubj, nt)    
+  # Fill first column.
+  Z[, 1] <- sample(c(1, 2), 
+                   replace = TRUE, 
+                   prob = c(p0, 1 - p0), 
+                   size = nsubj)
+  # table(Z[, 1])
+  # Fill subsequent columns.
+  for (t in 2 : nt){
+    for(i in 1 : nsubj){
+      Z[i, t] <- sample(c(1, 2),
+                        size = 1,
+                        prob = tp[Z[i, t - 1], ])
+    }
+  }
+  # Generate random effect and data.
+  re_ls <- mvrnorm(nsubj, mu = c(0, 0), Sigma = cov_ls)
+  re_loc <- re_ls[, 1]
+  re_scale <- re_ls[, 2]
+  y <- matrix(NA, nrow = nsubj, ncol= nt)
+  
+  if(scenario==2){
+    for (i in 1 : nsubj){
+      for(t in 1 : nt){
+        y[i, t] <- rnorm(1, mu[Z[i,t]] + re_loc[i], sig_e[Z[i,t]] * sqrt(exp(re_scale[i])))
+      }
+    }
+  }
+  
+  if(scenario==1){
+    for(i in 1:nsubj){
+      for(t in 1:nt){
+        y[i,t] <- rnorm(1, mu[Z[i,t]] + re_loc[i], sig_e[Z[i,t]])
+      }
+    }
+  }
+  
+  # Output generated data
+  sim.df <- data.frame(subject = rep(seq_len(nsubj), each = nt),
+                       time = rep(seq_len(nt), nsubj),
+                       y = as.vector(t(y)))
+  # Return data set
+  return(list(re_loc = re_loc,
+              re_scale = re_scale,
+              y = y,
+              sim.df = sim.df))
+}
+```
+
+
+# Data Extraction Function
+```{r}
+## Data extraction (Scenario 1)
+set.seed(91000)
+reps = 100
+for(rep in 1:reps){
+  data = DataGen_HMM(1)
+  saveRDS(data,paste0("data_HMM_scenario1_",toString(rep)))
+}
+
+## Data extraction (Scenario 2)
+set.seed(919178)
+reps = 100
+for(rep in 1:reps){
+  data = DataGen_HMM(2)
+  saveRDS(data,paste0("data_HMM_scenario2_",toString(rep)))
+}
+```
+
+
+
+
+# Function for MCMC
+```{r}
+run_MCMC_HMM = function(data, model_num, iter = niter_t, 
+                        warmup = nwarmup_t,chains=nchains_t){
+  model_names = c("hmm.stan","hmm_l.stan","hmm_ls.stan")
+  model_file = model_names[model_num]
+  data.list = data
+  StanDat <- list(K = 2,
+                nsubj = length(unique(data.list[[4]]$subject)),
+                nt = length(unique(data.list[[4]]$time)),
+                y = data.list[[3]])
+  
+  ## Get initial value
+  InitFit <- lmer(y ~ (1 | subject), data = data.list[[4]])
+  sum <- summary(InitFit)
+  
+  if(model_num==3){
+    StanInit <- function(){list(p0 = 0.5,tp = c(0.8, 0.8),
+                                mu = c(sum$coefficients[1, "Estimate"] - 0.1, 
+                                       sum$coefficients[1, "Estimate"]) + 0.1,
+                                sig_e = c(sum$sigma + 0.5, sum$sigma - 0.5),
+                                sig_ls = c(sqrt(diag(VarCorr(InitFit)$subject)), 0.01),
+                                chol_ls = chol(matrix(c(1, -0.3, -0.3, 1), 
+                                                      nrow = 2, byrow = T)),
+                                theta = array(rnorm(2*nsubj_t), dim = c(nsubj_t, 2)))}
+  }else if(model_num==1){
+     StanInit <-function(){ list(p0 = 0.5, tp = c(0.8, 0.8), 
+                                 mu = c(sum$coefficients[1, "Estimate"] - 0.1, 
+                                        sum$coefficients[1, "Estimate"]) + 0.1,
+                                 sig_e = c(sum$sigma + 0.5, sum$sigma - 0.5))}
+  }else if(model_num==2){
+      StanInit <-function(){ list(p0 = 0.5,tp = c(0.8, 0.8),
+                                  mu = c(sum$coefficients[1, "Estimate"] - 0.1, 
+                                         sum$coefficients[1, "Estimate"]) + 0.1,
+                                  sig_e = c(sum$sigma + 0.5, sum$sigma - 0.5),
+                                  sig_loc = sqrt(diag(VarCorr(InitFit)$subject)),
+                                  theta = rnorm(nsubj_t))}
+  }
+  
+  # Get model fit:
+  HmmFit <- stan(data = StanDat,
+                  file = model_file,
+                  init = StanInit,
+                  iter = iter,
+                  warmup = warmup, 
+                  chains = chains,
+                  cores = 10)
+  
+  return(HmmFit)
+}
+```
+
+
+## Model 1: Fitting Location and Scale Model
+```{r}
+# Location and Scale
+for(rep in 1:100){
+  data = readRDS(paste0("data_HMM_scenario2_",toString(rep)))
+  fit = run_MCMC_HMM(data = data,model_num = 3, iter = 2500, warmup = 1000, chains = 4)
+  saveRDS(fit,paste0("HMM_fit_ls_",toString(rep)))
+}
+```
+
+
+```{r}
+# Computing Statistics from MCMC fits 
+extract_statistics_HMM_ls = function(){
+  nreps = 100
+  
+  means = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_ls1 = numeric(), sig_ls2 = numeric())
+  
+  lower = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_ls1 = numeric(), sig_ls2 = numeric())
+    
+  upper = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_ls1 = numeric(), sig_ls2 = numeric())
+  
+  params = c("p0","tp[1]","tp[2]","mu[1]","mu[2]",
+             "sig_e[1]","sig_e[2]","sig_ls[1]","sig_ls[2]")
+  
+  for(rep in 1:nreps){
+    fit = readRDS(paste0("HMM_fit_ls_",toString(rep)))
+    sum = summary(fit)
+    index = 1
+    for(par in params){
+      means[rep,index] = sum$summary[par,"mean"]
+      lower[rep,index] = sum$summary[par,"2.5%"]
+      upper[rep,index] = sum$summary[par,"97.5%"]
+      index = index + 1
+    }
+  }
+  res = list(means, lower, upper)
+  return(res)
+}
+```
+
+
+```{r}
+model2_stats = extract_statistics_HMM_ls()
+```
+
+```{r}
+means = model2_stats[[1]]
+lower = model2_stats[[2]]
+upper = model2_stats[[3]]
+mean_estimates = colMeans(means)
+true_values = c(0.5,0.9,0.7,1,2,2,1,1,sqrt(0.3))
+bias = mean_estimates - true_values
+print(bias)
+AIW = colMeans(upper - lower)
+```
+
+
+
+```{r}
+covered = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                   mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                   sig_ls1 = numeric(), sig_ls2 = numeric())
+
+true_values = c(0.5,0.9,0.7,1,2,2,1,1,sqrt(0.3))
+pars = c("p0","tp1","tp2","mu1","mu2","sig_e1","sig_e2","sig_ls1","sig_ls2")
+names(true_values) = pars
+
+for(i in 1:100){
+  for(par in pars){
+    true_val = true_values[par]
+    if(lower[i,par]<true_val & upper[i,par]>true_val){
+      covered[i,par] = 1
+    }else{
+      covered[i,par] = 0
+    }
+  }
+}
+
+coverage = colMeans(covered)
+```
+
+```{r}
+table_model2 = list(bias = bias, AIW = AIW, coverage = coverage)
+table_model2
+```
+
+
+## Model 2: Regular HMM
+
+```{r}
+# Regular HMM
+for(rep in 1:50){
+  data = readRDS(paste0("data_HMM_scenario2_",toString(rep)))
+  fit = run_MCMC_HMM(data = data,model_num = 1, iter = 2500, warmup = 1000, chains = 4)
+  saveRDS(fit,paste0("HMM_fit_",toString(rep)))
+}
+```
+
+```{r}
+# Computing Statistics from MCMC fits 
+extract_statistics_HMM = function(){
+  nreps = 50
+  
+  means = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric())
+  
+  lower = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric())
+    
+  upper = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric())
+  
+  params = c("p0","tp[1]","tp[2]","mu[1]","mu[2]",
+             "sig_e[1]","sig_e[2]")
+  
+  for(rep in 1:nreps){
+    fit = readRDS(paste0("HMM_fit_",toString(rep)))
+    sum = summary(fit)
+    index = 1
+    for(par in params){
+      means[rep,index] = sum$summary[par,"mean"]
+      lower[rep,index] = sum$summary[par,"2.5%"]
+      upper[rep,index] = sum$summary[par,"97.5%"]
+      index = index + 1
+    }
+  }
+  res = list(means, lower, upper)
+  return(res)
+}
+```
+
+
+```{r}
+model_HMM_stats = extract_statistics_HMM()
+```
+
+
+```{r}
+means = model_HMM_stats[[1]]
+lower = model_HMM_stats[[2]]
+upper = model_HMM_stats[[3]]
+mean_estimates = colMeans(means)
+true_values = c(0.5,0.9,0.7,1,2,2,1)
+bias = mean_estimates - true_values
+print(bias)
+AIW = colMeans(upper - lower)
+```
+
+```{r}
+covered = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                   mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric())
+
+true_values = c(0.5,0.9,0.7,1,2,2,1)
+pars = c("p0","tp1","tp2","mu1","mu2","sig_e1","sig_e2")
+names(true_values) = pars
+
+for(i in 1:50){
+  for(par in pars){
+    true_val = true_values[par]
+    if(lower[i,par]<true_val & upper[i,par]>true_val){
+      covered[i,par] = 1
+    }else{
+      covered[i,par] = 0
+    }
+  }
+}
+
+coverage = colMeans(covered)
+```
+
+```{r}
+table_model_HMM= list(bias = bias, AIW = AIW, coverage = coverage)
+table_model_HMM
+```
+
+
+
+
+
+
+
+
+
+## Model 3: Mixed HMM
+```{r}
+# Regular HMM
+for(rep in 1:50){
+  data = readRDS(paste0("data_HMM_scenario2_",toString(rep)))
+  fit = run_MCMC_HMM(data = data,model_num = 2, iter = 2500, warmup = 1000, chains = 4)
+  saveRDS(fit,paste0("HMM_l_fit_",toString(rep)))
+}
+```
+
+```{r}
+extract_statistics_HMM_l = function(){
+  nreps = 50
+  
+  means = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_loc = numeric())
+  
+  lower = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_loc = numeric())
+    
+  upper = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                     mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                     sig_loc = numeric())
+  
+  params = c("p0","tp[1]","tp[2]","mu[1]","mu[2]",
+             "sig_e[1]","sig_e[2]","sig_loc")
+  
+  for(rep in 1:nreps){
+    fit = readRDS(paste0("HMM_l_fit_",toString(rep)))
+    sum = summary(fit)
+    index = 1
+    for(par in params){
+      means[rep,index] = sum$summary[par,"mean"]
+      lower[rep,index] = sum$summary[par,"2.5%"]
+      upper[rep,index] = sum$summary[par,"97.5%"]
+      index = index + 1
+    }
+  }
+  res = list(means, lower, upper)
+  return(res)
+}
+```
+
+```{r}
+model_l_stats = extract_statistics_HMM_l()
+```
+
+```{r}
+means = model_l_stats[[1]]
+lower = model_l_stats[[2]]
+upper = model_l_stats[[3]]
+mean_estimates = colMeans(means)
+true_values = c(0.5,0.9,0.7,1,2,2,1,1)
+bias = mean_estimates - true_values
+print(bias)
+AIW = colMeans(upper - lower)
+```
+
+
+```{r}
+covered = data.frame(p0 = numeric(), tp1 = numeric(), tp2 = numeric(),
+                   mu1 = numeric(), mu2 = numeric(), sig_e1 = numeric(), sig_e2 = numeric(),
+                   sig_loc = numeric())
+
+true_values = c(0.5,0.9,0.7,1,2,2,1,1)
+pars = c("p0","tp1","tp2","mu1","mu2","sig_e1","sig_e2","sig_loc")
+names(true_values) = pars
+
+for(i in 1:50){
+  for(par in pars){
+    true_val = true_values[par]
+    if(lower[i,par]<true_val & upper[i,par]>true_val){
+      covered[i,par] = 1
+    }else{
+      covered[i,par] = 0
+    }
+  }
+}
+
+coverage = colMeans(covered)
+```
+
+
+
+```{r}
+table_model2 = list(bias = bias, AIW = AIW, coverage = coverage)
+table_model2
+```
+
+
+
+
+
+
+
+
+
+

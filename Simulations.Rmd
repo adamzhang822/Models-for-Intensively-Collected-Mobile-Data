@@ -1,0 +1,510 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r,warning=FALSE}
+# prep
+library(rlist)
+library(MASS)
+library(nlme)
+library(lme4)
+library(rstan)
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+library(Matrix)
+```
+
+
+
+# Simulation 1: Dealing with Autocorrelation
+
+```{r}
+# AR(1) matrix generation 
+ar1_cor = function(n, rho) {
+  exponent = abs(matrix(1:n - 1, nrow = n, ncol = n, byrow = TRUE) -  (1:n - 1))
+  return(rho^exponent)
+}
+```
+
+
+```{r}
+
+
+# Data generation
+
+sim_one_data_ar = function(nsubj = 1000,
+                        nobs = 35,
+                        beta = c(5.0,0.4,-1.0,0.7,1.9),
+                        sigma2 = c(exp(0.5),exp(2)),
+                        rho = 0.3){
+  
+  #ids 
+  subj_id = rep(1:nsubj,each=nobs)
+  obs_id = rep(1:nobs,nsubj)
+  
+  # covariates: intercept, level-1 continuous, level-1 binary, level-2 continuous, level-2 binary
+  level1_cont = rnorm(nobs * nsubj, 4, 2) # time-varying continuous variable, could be alcohol level...etc
+  level1_bin = rbinom(nobs*nsubj, 1, 0.3) # time-varying categoricacl variable, could be being alone / not 
+  level2_cont = rep(rnorm(nsubj,2,4),each = nobs) # time-invarying continuous variable, could be 
+  level2_bin = rep(rbinom(nsubj,1,0.5),each=nobs) # time-invarying categorical variable, could be sex 
+  
+  # random subject effects
+  re_subj = rnorm(nsubj, 0, sqrt(sigma2[2]))
+  
+  # random level-1 errors 
+  cov_mat = ar1_cor(nobs,rho) * sigma2[1]
+  
+  # generate y's:
+  ys = list()
+  for(i in 1:nsubj){
+    re_i = re_subj[i]
+    begin = (nobs * (i-1)) + 1
+    end = nobs * i
+    mean_subj = beta[1] + beta[2] * level1_cont[begin:end] + beta[3] * level1_bin[begin:end] + re_i + 
+                beta[4] * level2_cont[begin:end] + beta[5] * level2_bin[begin:end]
+    y = mvrnorm(1,mean_subj, cov_mat)
+    ys = list.append(ys,y)
+  }
+  
+  y = unlist(ys)
+  data = data.frame(subj_id = subj_id, obs_id = obs_id,  level1_cont = level1_cont,
+                  level1_bin = level1_bin, level2_cont = level2_cont, level2_bin = level2_bin, y = y)
+  return(data)
+}
+
+sim_data_ar = function(n_datasets = 500){
+  datas = list()
+  for(i in 1:n_datasets){
+    data = sim_one_data_ar()
+    datas = list.append(datas,data)
+  }
+  return(datas)
+}
+
+datasets = sim_data_ar()
+
+```
+
+
+```{r}
+# Model 1: Mixed Effects Model with AR(1)
+
+b0 = list(); b1 = list(); b2 = list();b3 = list();b4 = list()
+rho = list(); sd_nu = list(); sd_resid = list();
+coverage = rep(0,8)
+names = c("b0","b1","b2","b3","b4","rho","sd_nu","sd_resid")
+names(coverage) = names
+
+# get intervals and estimates
+for(i in 1:500){
+  data_cur = datasets[[i]]
+  lme_simple_fit = lme(y~level1_cont+level1_bin+level2_cont+level2_bin,
+                      random = ~1|subj_id, data=data_cur,correlation=corAR1(form=~1|subj_id))
+  ints = intervals(lme_simple_fit, level=0.95)
+  
+  b0 = list.append(b0,ints$fixed[1,])
+  b1 = list.append(b1,ints$fixed[2,])
+  b2 = list.append(b2,ints$fixed[3,])
+  b3 = list.append(b3,ints$fixed[4,])
+  b4 = list.append(b4,ints$fixed[5,])
+  rho = list.append(rho,ints$corStruct)
+  sd_nu = list.append(sd_nu, ints$reStruct[[1]])
+  sd_resid = list.append(sd_resid,ints$sigma)
+}
+
+intervals = list(b0=b0,b1=b1,b2=b2,b3=b3,b4=b4,rho=rho,sd_nu=sd_nu,sd_resid=sd_resid)
+true_vals = c(5.0,0.4,-1.0,0.7,1.9,0.75,sqrt(exp(2)),sqrt(exp(0.5)))
+
+
+# get coverage 
+for(i in 1:8){
+  param = intervals[[i]]
+  true_val = true_vals[i]
+  tots = 0
+  for(j in 1:500){
+    lower = param[[j]][1]
+    upper = param[[j]][3]
+    if(lower<true_val & upper>true_val){
+      tots = tots + 1
+    }
+  }
+  coverage[i] = tots/500
+}
+
+```
+
+```{r}
+coverage
+```
+
+```{r}
+# Model 2: Mixed Effects Model without AR(1)
+b0 = list(); b1 = list(); b2 = list();b3 = list();b4 = list();
+coverage2 = rep(0,5)
+names = c("b0","b1","b2","b3","b4")
+names(coverage2) = names
+
+# get intervals and estimates
+for(i in 1:500){
+  data_cur = datasets[[i]]
+  lme_simple_fit = lmer(y~level1_cont + level1_bin + level2_cont + level2_bin + (1|subj_id), 
+                      data= data_cur)
+  ints = confint(lme_simple_fit,method="Wald")
+  
+  b0 = list.append(b0,ints[3,])
+  b1 = list.append(b1,ints[4,])
+  b2 = list.append(b2,ints[5,])
+  b3 = list.append(b3,ints[6,])
+  b4 = list.append(b4,ints[7,])
+}
+
+intervals = list(b0=b0,b1=b1,b2=b2,b3=b3,b4=b4)
+true_vals = c(5.0,0.4,-1.0,0.7,1.9)
+
+
+# get coverage 
+for(i in 1:5){
+  param = intervals[[i]]
+  true_val = true_vals[i]
+  tots = 0
+  for(j in 1:500){
+    lower = param[[j]][1]
+    upper = param[[j]][2]
+    if(lower<true_val & upper>true_val){
+      tots = tots + 1
+    }
+  }
+  coverage2[i] = tots/500
+}
+
+```
+
+```{r}
+coverage2
+```
+
+
+
+```{r}
+# Model 3: Lagged Dependent Variable
+
+b0 = list(); b1=list(); b2=list(); b3=list(); b4=list(); rho=list();
+coverage3 = rep(0,6)
+names = c("b0","b1","b2","b3","b4","rho")
+names(coverage3) = names
+
+# get intervals and estimates
+for(i in 1:500){
+  data_cur = datasets[[i]]
+  
+  for(subj_id in 1:nsubj){
+    begin = (nobs * (subj_id-1)) + 1
+    for(obs in 2:nobs){
+      data_cur$y_lagged[begin+obs-1] = data_cur$y[begin+obs-2]  # create lagged variables 
+    }
+  }
+  
+  
+  lme_simple_fit = lmer(y~level1_cont + level1_bin + level2_cont + level2_bin + y_lagged + (1|subj_id), 
+                      data= data_cur)
+  ints = confint(lme_simple_fit,method="Wald")
+  
+  b0 = list.append(b0,ints[3,])
+  b1 = list.append(b1,ints[4,])
+  b2 = list.append(b2,ints[5,])
+  b3 = list.append(b3,ints[6,])
+  b4 = list.append(b4,ints[7,])
+  rho = list.append(rho,ints[8,])
+}
+
+intervals = list(b0=b0,b1=b1,b2=b2,b3=b3,b4=b4,rho=rho)
+true_vals = c(5.0,0.4,-1.0,0.7,1.9,0.75)
+
+
+# get coverage 
+for(i in 1:6){
+  param = intervals[[i]]
+  true_val = true_vals[i]
+  tots = 0
+  for(j in 1:500){
+    lower = param[[j]][1]
+    upper = param[[j]][2]
+    if(lower<true_val & upper>true_val){
+      tots = tots + 1
+    }
+  }
+  coverage3[i] = tots/500
+}
+
+```
+
+```{r}
+coverage3
+```
+
+
+
+
+# Simulation 2: MELS Model and AR(1) Model Robustness
+
+```{r}
+# Generate Data
+DataGen = function(nsubj = 150, 
+                    nobs = 25, beta = c(1,1,1), 
+                    tau = c(0.5,0.6,-0.4), 
+                    sd_subj_loc = 1,
+                    sd_subj_scale = 0.8, 
+                    tau_ell = 0.3,
+                    rho = 0.3){
+  
+  beta0 = beta[1]; beta1 = beta[2]; beta2 = beta[3]
+  tau0 = tau[1]; tau1 = tau[2]; tau2 = tau[3]
+  
+
+  ## Generate subject indicators
+  N = nsubj * nobs
+  subject =　gl(n = nsubj, k =  nobs)
+
+  ## Generate subject and obs level covariates (observed).
+  x_subj_orig = rbinom(nsubj,1,0.5) # subject-level covariate value for each subject
+  x_subj = rep(x_subj_orig,each=nobs) # extending the subject-level covariate values to fit to design matrix format 
+  x_obs = rnorm(N)
+  
+  ## Generate random subject effects for each subject 
+  theta1 = rep(rnorm(nsubj), each = nobs)
+  theta2 = rep(rnorm(nsubj), each = nobs)
+  
+  ## Generate the mean
+  y_mean = beta0 + beta1 * x_subj + beta2 * x_obs + sd_subj_loc * theta1
+  ## Generate the sd
+  y_sd = sqrt(exp(tau0 + tau1 * x_subj + tau2 * x_obs + tau_ell * theta1 + sd_subj_scale *theta2))
+  
+  ## Generate covariance matrices for each subject
+  cov_mats = list()
+  ar_mat = ar1_cor(nobs,rho)
+  for(i in 1:nsubj){
+    begin = (nobs * (i-1)) + 1
+    end = nobs * i
+    y_subj = y_sd[begin:end] ## sds for each subject 
+    y_cov_mat = outer(y_subj,y_subj,FUN="*") * ar_mat
+    cov_mats = list.append(cov_mats,y_cov_mat)
+  }
+  
+
+  # Generate Responses
+  ys = list()
+  for(i in 1:nsubj){
+    begin = (nobs * (i-1)) + 1
+    end = nobs * i
+    y_mean_cur = y_mean[begin:end]
+    y_cur = mvrnorm(1,y_mean_cur,cov_mats[[i]])
+    ys = list.append(ys,y_cur)
+  }
+  y = unlist(ys)
+
+  ## Return a data frame
+  df_LSME = list(data = data.frame(subject = subject, 
+                        x1 = x_subj, x2 = x_obs,y = y),x_subj_orig = x_subj_orig)
+  return(df_LSME)
+}
+```
+
+
+```{r}
+# Generating the datasets
+set.seed(91910888)
+reps = 50
+data_sim2_lists = list()
+for(rep in 1:reps){
+  data_sim2_lists = list.append(data_sim2_lists, DataGen()$data)
+}
+```
+
+
+```{r}
+# Model 2: Ignore autocorrelation and just fit MELS model, estimated using Bayes
+set.seed(91910888)
+reps = 500
+for(rep in 1:reps){
+  data = DataGen(nsubj = 150, nobs = 25)
+  saveRDS(data,paste0("data_ar",toString(rep)))
+}
+
+```
+
+
+```{r}
+run_MCMC = function(data, model, iter = 1000, warmup = 500, chains = 4){
+  
+  model_names = c("MEL.stan","MELS.stan", "MELS_AR.stan")
+  model_name = model_names[model] # flag for which model to use
+  
+  # Prepare data for Stan
+  df.LSME = data$data 
+  x_subj_orig = data$x_subj_orig # subject-level variable in original format for 
+                                  # generating subject level random effect variance in Stan
+  nsubj = length(unique(df.LSME$subject))
+  nobs = 25
+  N = nrow(df.LSME)
+  x1 = df.LSME$x1 # subject level variable
+  x2 = df.LSME$x2 # occasion level variable
+  subject = as.integer(df.LSME$subject) # subject ids 
+  #  Design matrix:  
+  X_mean = unname(model.matrix(~ 1 + x1 + x2)) # design matrix for mean
+  X_var = unname(model.matrix(~ 1 + x1 + x2)) # design matrix for variance 
+  y = df.LSME$y
+
+  # Combine to list format for Stan
+  if(model==3){
+    X_mean_stan = array(X_mean,dim=c(25,150,3))
+    X_var_stan = array(X_var, dim=c(25,150,3))
+    y_stan = array(y,dim=c(25,150))
+    ar1_pow =  abs(matrix(1:nobs - 1, nrow = nobs, ncol = nobs, byrow = TRUE) -  (1:nobs - 1))
+    StanDat =list(N=N,nsubj = nsubj, nobs = nobs, subject = subject, 
+                  X_mean = X_mean_stan, X_var = X_var_stan, y = t(y_stan), ar1_pow = ar1_pow)
+  }else{
+    StanDat = list (N = N, nsubj = nsubj,subject = subject,X_mean = X_mean, X_var = X_var, y = y)
+  }
+  
+  lme_fit = lmer(y ~ x1 + x2 + (1|subject))
+  sum = summary(lme_fit)
+  beta_init = sum$coefficients[,"Estimate"]
+  sigma_subj_loc_init = sqrt(diag(VarCorr(lme_fit)$subject))
+  tau_init = c(log(sum$sigma),0,0)
+  
+  if(model == 1){
+    MLS_init = function(){
+      list(beta = beta_init,
+           sigma_subj_loc = sigma_subj_loc_init,
+           tau = tau_init,
+           z_subj_loc = rnorm(nsubj))
+    }
+  }else if(model == 2){
+    MLS_init = function(){
+      list(beta = beta_init,
+           sigma_subj_loc = sigma_subj_loc_init,
+           tau = tau_init,
+           tau_ell = 0.1,
+           sigma_subj_scale = 0.1,
+           z_subj_loc = rnorm(nsubj),
+           z_subj_scale = rnorm(nsubj))
+    }
+  }else if(model == 3){
+    MLS_init = function(){
+      list(beta = beta_init,
+           sigma_subj_loc = sigma_subj_loc_init,
+           tau = tau_init,
+           tau_ell = 0.1,
+           sigma_subj_scale = 0.1,
+           z_subj_loc = rnorm(nsubj),
+           z_subj_scale = rnorm(nsubj),
+           rho = 0.5)
+    }
+  }
+
+  MLS.fit = stan(data = StanDat,
+                file = model_name,
+                init = MLS_init,
+                iter = iter,
+                warmup = warmup,
+                chains = chains)
+  
+  return(MLS.fit)
+}
+```
+
+
+### For Model 2 (MELS on AR(1) data : 
+```{r}
+# model 2
+for(rep in 1:50){
+  data = readRDS(paste0("data_ar",toString(rep)))
+  fit = run_MCMC(data,model = 2, iter = 2000, warmup = 500, chains = 4)
+  saveRDS(fit,paste0("MCMC_fit_model2_low_ar",toString(rep)))
+}
+```
+
+
+```{r}
+# Computing Statistics from MCMC fits (from model 2)
+extract_statistics_model2 = function(){
+  nreps = 50
+  means = data.frame(beta0 = numeric(),beta1 = numeric(), beta2 = numeric(),
+                     tau0 = numeric(), tau1 = numeric(), tau2 = numeric(),
+                     sd_subj_loc = numeric(), sd_subj_scale = numeric(), tau_ell = numeric())
+  
+  lower = data.frame(beta0 = numeric(),beta1 = numeric(), beta2 = numeric(),
+                     tau0 = numeric(), tau1 = numeric(), tau2 = numeric(),
+                     sd_subj_loc = numeric(), sd_subj_scale = numeric(), tau_ell = numeric())
+  
+  upper = data.frame(beta0 = numeric(),beta1 = numeric(), beta2 = numeric(),
+                     tau0 = numeric(), tau1 = numeric(), tau2 = numeric(),
+                     sd_subj_loc = numeric(), sd_subj_scale = numeric(), tau_ell = numeric())
+  params = c("beta[1]","beta[2]","beta[3]","tau[1]","tau[2]","tau[3]",
+             "sigma_subj_loc","sigma_subj_scale","tau_ell")
+  
+  for(rep in 1:nreps){
+    fit = readRDS(paste0("MCMC_fit_model2_low_ar",toString(rep)))
+    sum = summary(fit)
+    index = 1
+    for(par in params){
+      means[rep,index] = sum$summary[par,"mean"]
+      lower[rep,index] = sum$summary[par,"2.5%"]
+      upper[rep,index] = sum$summary[par,"97.5%"]
+      index = index + 1
+    }
+  }
+  res = list(means, lower, upper)
+  return(res)
+}
+```
+
+```{r}
+model2_stats = extract_statistics_model2()
+means = model2_stats[[1]]
+lower = model2_stats[[2]]
+upper = model2_stats[[3]]
+mean_estimates = colMeans(means)
+true_values = c(1,1,1,0.5,0.6,-0.4,1,0.8,0.3)
+bias = mean_estimates - true_values
+print(bias)
+AIW = colMeans(upper - lower)
+```
+
+```{r}
+covered = data.frame(beta0 = numeric(),beta1 = numeric(), beta2 = numeric(),
+                     tau0 = numeric(), tau1 = numeric(), tau2 = numeric(),
+                     sd_subj_loc = numeric(), sd_subj_scale = numeric(), tau_ell = numeric())
+
+true_values = c(1,1,1,0.5,0.6,-0.4,1,0.8,0.3)
+pars = c("beta0","beta1","beta2","tau0","tau1","tau2","sd_subj_loc","sd_subj_scale","tau_ell")
+names(true_values) = pars
+
+for(i in 1:50){
+  for(par in pars){
+    true_val = true_values[par]
+    if(lower[i,par]<true_val & upper[i,par]>true_val){
+      covered[i,par] = 1
+    }else{
+      covered[i,par] = 0
+    }
+  }
+}
+
+coverage = colMeans(covered)
+```
+
+
+```{r}
+table_model2 = list(bias = bias, AIW = AIW, coverage = coverage)
+table_model2
+```
+
+
+
+
+
+
+
+
